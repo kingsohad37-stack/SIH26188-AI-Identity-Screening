@@ -3,12 +3,14 @@ import { useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { Loader2, ScanFace } from 'lucide-react'
 
+const SCREENING_API = 'https://sih26188-ai-identity-screening.onrender.com'
+
 export function FaceVerification({ screeningId }: { screeningId: string }) {
   const [file, setFile] = useState<File | null>(null); const [busy, setBusy] = useState(false); const [result, setResult] = useState<string>(''); const [error, setError] = useState('')
   async function verify() {
-    if (!file) return; setBusy(true); setError(''); setResult(''); const supabase = createClient(); const { data: { session } } = await supabase.auth.getSession(); const api = process.env.NEXT_PUBLIC_SCREENING_API_URL
-    if (!api || !session) { setError('Screening API or session is unavailable.'); setBusy(false); return }
-    const form = new FormData(); form.append('reference', file); const response = await fetch(`${api}/v1/screenings/${screeningId}/face-verify`, { method: 'POST', headers: { Authorization: `Bearer ${session.access_token}` }, body: form }); const body = await response.json().catch(() => ({}))
+    if (!file) return; setBusy(true); setError(''); setResult(''); const supabase = createClient(); const { data: { session } } = await supabase.auth.getSession()
+    if (!session) { setError('Your session is unavailable. Please sign in again.'); setBusy(false); return }
+    const form = new FormData(); form.append('reference', file); const response = await fetch(`${SCREENING_API}/v1/screenings/${screeningId}/face-verify`, { method: 'POST', headers: { Authorization: `Bearer ${session.access_token}` }, body: form }); const body = await response.json().catch(() => ({}))
     if (!response.ok) setError(body.detail || 'Face verification failed.')
     else setResult(body.result?.status === 'passed' ? 'Face similarity passed the screening threshold.' : body.result?.status === 'failed' ? 'Face similarity did not pass the screening threshold.' : 'Face verification was not evaluated.')
     setBusy(false); if (response.ok) window.location.reload()
