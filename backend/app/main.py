@@ -1,4 +1,4 @@
-import os, tempfile
+import os, tempfile, json
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -11,6 +11,7 @@ from supabase import create_client, Client
 from .config import settings
 from .pipeline import analyze_file
 from .face import FaceEngine
+from .sightengine import analyze_image as analyze_with_sightengine
 
 app = FastAPI(title="SIH26188 Screening API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=[settings.allowed_origin], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -45,7 +46,7 @@ def download_user_file(token: str, storage_path: str) -> bytes:
     url = f"{settings.supabase_url}/storage/v1/object/authenticated/screening-documents/{encoded_path}"
     request = Request(url, headers={"apikey": settings.supabase_publishable_key, "Authorization": f"Bearer {token}"})
     try:
-        with urlopen(request, timeout=60) as response: return response.read()
+        with urlopen(request, timeout=30) as response: return response.read()
     except Exception as exc: raise RuntimeError(f"Storage download failed: {type(exc).__name__}") from exc
 
 def audit(client: Client, screening_id: str, user_id: str, action: str, details=None):
@@ -62,21 +63,48 @@ def run_analysis(token: str, user_id: str, screening_id: str, doc: dict, supabas
         suffix = os.path.splitext(doc["original_filename"])[1] or ".bin"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
             f.write(blob); local_path = f.name
+
+        # PRIMARY PATH: local OCR/MRZ/forensics only. This is what makes the
+        # screening result independent of external API latency.
         result = analyze_file(local_path, doc["mime_type"])
-        supabase.table("screening_documents").update({"analysis_status":"completed","document_type":result["document_type"],"extracted_data":result["extracted_data"],"analysis_metadata":{"model_version":settings.model_version,"forensics":result["forensics"],"forensic_assessment":result["forensic_assessment"],"pages_processed":result["pages_processed"],"processed_at":result["processed_at"]}}).eq("id",doc["id"]).eq("user_id",user_id).execute()
+        supabase.table("screening_documents").update({"analysis_status":"completed","document_type":result["document_type"],"extracted_data":result["extracted_data"],"analysis_metadata":{"model_version":settings.model_version,"forensics":result["forensics"],"forensic_assessment":result["forensic_assessment"],"pages_processed":result["pages_processed"],"processed_at":result["processed_at"],"sightengine":{"status":"pending"}}}).eq("id",doc["id"]).eq("user_id",user_id).execute()
+        local_forensic_status = result["forensic_assessment"]["status"]
         checks=[
             {"screening_id":screening_id,"check_type":"ocr","status":"passed","details":{"pages_processed":result["pages_processed"]},"model_version":settings.model_version},
             {"screening_id":screening_id,"check_type":"mrz_validation","status":result["extracted_data"]["validation"]["status"],"details":result["extracted_data"]["validation"],"model_version":settings.model_version},
-            {"screening_id":screening_id,"check_type":"image_forensics","status":result["forensic_assessment"]["status"],"details":{"signals":result["forensics"],"assessment":result["forensic_assessment"]},"model_version":settings.model_version}]
+            {"screening_id":screening_id,"check_type":"image_forensics","status":local_forensic_status,"details":{"signals":result["forensics"],"assessment":result["forensic_assessment"]},"model_version":settings.model_version}]
         supabase.table("screening_checks").insert(checks).execute()
-        severity="high" if result["extracted_data"]["validation"]["status"]=="failed" else ("warning" if result["forensic_assessment"]["status"]=="suspicious" else "info")
+        severity="high" if result["extracted_data"]["validation"]["status"]=="failed" else ("warning" if local_forensic_status=="suspicious" else "info")
         code="MRZ_VALIDATION_FAILED" if severity=="high" else ("FORENSIC_REVIEW_SIGNAL" if severity=="warning" else "BASELINE_ANALYSIS_COMPLETED")
         title="MRZ validation requires review" if severity=="high" else ("Forensic review signal detected" if severity=="warning" else "Baseline analysis completed")
         description="One or more deterministic MRZ/date checks failed." if severity=="high" else ("Localized recompression differences were detected; this is not proof of tampering." if severity=="warning" else "OCR, MRZ parsing and deterministic image-forensics signals were evaluated. These checks do not establish document authenticity by themselves.")
         finding={"screening_id":screening_id,"severity":severity,"code":code,"title":title,"description":description,"evidence":{"validation":result["extracted_data"]["validation"],"forensic_assessment":result["forensic_assessment"]}}
         supabase.table("screening_findings").insert(finding).execute()
-        audit(supabase,screening_id,user_id,"analysis_completed",{"document_type":result["document_type"]})
+        audit(supabase,screening_id,user_id,"analysis_completed",{"document_type":result["document_type"],"phase":"local"})
+        # Mark the primary result COMPLETE before external enrichment. The UI can
+        # therefore show the result immediately while Sightengine runs afterwards.
         supabase.table("screenings").update({"status":"completed","document_type":result["document_type"],"overall_assessment":"inconclusive"}).eq("id",screening_id).eq("user_id",user_id).execute()
+
+        # SECONDARY PATH: external enrichment runs only after the primary result
+        # has been persisted. It can improve the forensic signal but cannot hold
+        # the screening page in "processing".
+        try:
+            sightengine = analyze_with_sightengine(local_path)
+            recapture = ((sightengine.get("response") or {}).get("recapture") or {}).get("score")
+            genai = ((sightengine.get("response") or {}).get("genai") or {}).get("score")
+            sight_suspicious = (isinstance(recapture, (int, float)) and recapture > 0.5) or (isinstance(genai, (int, float)) and genai > 0.8)
+            if sight_suspicious:
+                reason = "Sightengine detected a likely recapture from a screen or printout." if isinstance(recapture, (int, float)) and recapture > 0.5 else "Sightengine detected a high likelihood of AI-generated image content."
+                merged_assessment = {"status":"suspicious","reason":reason,"sightengine_recapture_score":recapture,"sightengine_genai_score":genai,"local_assessment":result["forensic_assessment"]}
+                supabase.table("screening_checks").update({"status":"suspicious","details":{"signals":result["forensics"],"assessment":merged_assessment}}).eq("screening_id",screening_id).eq("check_type","image_forensics").execute()
+                supabase.table("screening_findings").insert({"screening_id":screening_id,"severity":"warning","code":"SIGHTENGINE_REVIEW_SIGNAL","title":"External forensic review signal detected","description":reason,"evidence":{"sightengine":sightengine}}).execute()
+                supabase.table("screening_documents").update({"analysis_metadata":{"model_version":settings.model_version,"forensics":result["forensics"],"forensic_assessment":merged_assessment,"pages_processed":result["pages_processed"],"processed_at":result["processed_at"],"sightengine":sightengine}}).eq("id",doc["id"]).eq("user_id",user_id).execute()
+                recompute_risk(supabase,screening_id,user_id)
+            else:
+                supabase.table("screening_documents").update({"analysis_metadata":{"model_version":settings.model_version,"forensics":result["forensics"],"forensic_assessment":result["forensic_assessment"],"pages_processed":result["pages_processed"],"processed_at":result["processed_at"],"sightengine":sightengine}}).eq("id",doc["id"]).eq("user_id",user_id).execute()
+            audit(supabase,screening_id,user_id,"sightengine_completed",{"status":sightengine.get("status")})
+        except Exception as exc:
+            audit(supabase,screening_id,user_id,"sightengine_failed",{"error_type":type(exc).__name__})
     except Exception as e:
         try:
             supabase.table("screening_documents").update({"analysis_status":"failed"}).eq("id",doc["id"]).eq("user_id",user_id).execute()
