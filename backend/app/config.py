@@ -1,8 +1,8 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    supabase_url: str
-    supabase_publishable_key: str
+    supabase_url: str = "https://ocxhnbtrowgtqsgxfdly.supabase.co"
+    supabase_publishable_key: str = "sb_publishable_HVG2Mt_BODr1BbGoKUZhZQ_w4HRdHQ3"
     allowed_origin: str = "http://localhost:3000"
     max_file_mb: int = 20
     model_version: str = "baseline-ocr-forensics-0.1"
