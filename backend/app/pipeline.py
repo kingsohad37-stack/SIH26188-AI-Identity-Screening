@@ -6,6 +6,7 @@ import pytesseract
 from .mrz import parse_mrz
 from .forensics import analyze_image
 from .validation import validate_mrz, assess_forensics
+from .sightengine import analyze_image as analyze_with_sightengine
 
 MAX_PDF_PAGES = 3
 OCR_MAX_SIDE = 1400
@@ -19,7 +20,7 @@ def ocr_image(path: str) -> str:
     with Image.open(path) as source:
         img=source.convert('RGB')
         img.thumbnail((OCR_MAX_SIDE,OCR_MAX_SIDE))
-        return pytesseract.image_to_string(img,config='--psm 6',timeout=15)
+        return pytesseract.image_to_string(img,config='--psm 6',timeout=8)
 
 def analyze_file(path: str,mime: str) -> dict:
     with tempfile.TemporaryDirectory(prefix='sih26188-') as td:
@@ -29,6 +30,8 @@ def analyze_file(path: str,mime: str) -> dict:
         for page in pages:
             texts.append(ocr_image(page))
             forensic.append(analyze_image(page))
+        # One external call on the first page keeps the external forensic signal useful without multiplying latency.
+        sightengine=analyze_with_sightengine(pages[0]) if pages else {'available':False,'status':'not_evaluated'}
         text='\n'.join(texts)
         mrz=parse_mrz(text)
         doc_type='passport' if mrz.get('format')=='TD3' or re.search(r'\bPASSPORT\b',text,re.I) else 'unknown'
@@ -36,4 +39,4 @@ def analyze_file(path: str,mime: str) -> dict:
         validation=validate_mrz(mrz)
         forensic_assessment=assess_forensics(forensic)
         extracted['validation']=validation
-        return {'document_type':doc_type,'extracted_data':extracted,'forensics':forensic,'forensic_assessment':forensic_assessment,'pages_processed':len(pages),'processed_at':datetime.now(timezone.utc).isoformat()}
+        return {'document_type':doc_type,'extracted_data':extracted,'forensics':forensic,'forensic_assessment':forensic_assessment,'sightengine':sightengine,'pages_processed':len(pages),'processed_at':datetime.now(timezone.utc).isoformat()}
