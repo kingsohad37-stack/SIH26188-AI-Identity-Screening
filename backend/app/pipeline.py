@@ -7,29 +7,27 @@ from .mrz import parse_mrz
 from .forensics import analyze_image
 from .validation import validate_mrz, assess_forensics
 
-# Keep rasterization intentionally light: identity documents are normally 1–3 pages.
+MAX_PDF_PAGES = 3
+OCR_MAX_SIDE = 1400
+
 def render_pdf(path: str, outdir: str) -> list[str]:
     prefix=os.path.join(outdir,'page')
-    subprocess.run(['pdftoppm','-png','-r','120',path,prefix],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    subprocess.run(['pdftoppm','-png','-r','120','-f','1','-l',str(MAX_PDF_PAGES),path,prefix],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     return sorted(str(p) for p in Path(outdir).glob('page-*.png'))
 
-def preprocess_for_ocr(path: str) -> str:
-    img=Image.open(path).convert('RGB')
-    img.thumbnail((1400,1400))
-    out=path+'.ocr.png'
-    img.save(out, optimize=True)
-    return out
+def ocr_image(path: str) -> str:
+    with Image.open(path) as source:
+        img=source.convert('RGB')
+        img.thumbnail((OCR_MAX_SIDE,OCR_MAX_SIDE))
+        return pytesseract.image_to_string(img,config='--psm 6',timeout=15)
 
 def analyze_file(path: str,mime: str) -> dict:
     with tempfile.TemporaryDirectory(prefix='sih26188-') as td:
         pages=render_pdf(path,td) if mime=='application/pdf' else [path]
-        # Three pages cover the normal identity-document footprint while avoiding slow
-        # OCR on long supporting-document PDFs. The report explicitly records the count.
-        pages=pages[:3]
+        pages=pages[:MAX_PDF_PAGES]
         texts=[]; forensic=[]
         for page in pages:
-            ocr_input=preprocess_for_ocr(page)
-            texts.append(pytesseract.image_to_string(Image.open(ocr_input),config='--psm 6'))
+            texts.append(ocr_image(page))
             forensic.append(analyze_image(page))
         text='\n'.join(texts)
         mrz=parse_mrz(text)
