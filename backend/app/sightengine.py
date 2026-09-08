@@ -1,8 +1,20 @@
+import io
 import json
 from urllib.request import Request, urlopen
-from urllib.parse import urlencode
+
+from PIL import Image
 
 from .config import settings
+
+
+def _fast_media(path: str) -> bytes:
+    """Shrink large uploads before the external vision request."""
+    with Image.open(path) as source:
+        image = source.convert("RGB")
+        image.thumbnail((1400, 1400))
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=78, optimize=True)
+        return buf.getvalue()
 
 
 def analyze_image(path: str) -> dict:
@@ -11,8 +23,11 @@ def analyze_image(path: str) -> dict:
         return {"available": False, "status": "not_configured", "reason": "Sightengine credentials are not configured."}
     try:
         boundary = b"----sih26188-sightengine"
-        with open(path, "rb") as f:
-            media = f.read()
+        try:
+            media = _fast_media(path)
+        except Exception:
+            with open(path, "rb") as f:
+                media = f.read()
         fields = {
             "models": settings.sightengine_models,
             "api_user": settings.sightengine_api_user,
@@ -26,7 +41,7 @@ def analyze_image(path: str) -> dict:
             body.extend(b"\r\n")
         body.extend(b"--" + boundary + b"\r\n")
         body.extend(b'Content-Disposition: form-data; name="media"; filename="document.jpg"\r\n')
-        body.extend(b"Content-Type: application/octet-stream\r\n\r\n")
+        body.extend(b"Content-Type: image/jpeg\r\n\r\n")
         body.extend(media)
         body.extend(b"\r\n--" + boundary + b"--\r\n")
         request = Request(
@@ -35,10 +50,10 @@ def analyze_image(path: str) -> dict:
             headers={"Content-Type": f"multipart/form-data; boundary={boundary.decode()}", "User-Agent": "SIH26188/1.0"},
             method="POST",
         )
-        with urlopen(request, timeout=8) as response:
+        with urlopen(request, timeout=2.5) as response:
             payload = json.loads(response.read().decode("utf-8"))
         if payload.get("status") != "success":
             return {"available": False, "status": "error", "response": payload}
         return {"available": True, "status": "completed", "models": settings.sightengine_models, "response": payload}
     except Exception as exc:
-        return {"available": False, "status": "error", "reason": type(exc).__name__}
+        return {"available": False, "status": "timeout_or_error", "reason": type(exc).__name__}
