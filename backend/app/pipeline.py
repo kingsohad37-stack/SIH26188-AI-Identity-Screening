@@ -7,9 +7,8 @@ import pytesseract
 from .mrz import parse_mrz
 from .forensics import analyze_image
 from .validation import validate_mrz, assess_forensics
-from .sightengine import analyze_image as analyze_with_sightengine
 
-# Fast-path limits: keep screening responsive while retaining the core signals.
+# Local-first limits: the primary screening result must not wait on any external API.
 MAX_PDF_PAGES = 3
 PDF_FORENSIC_PAGES = 1
 OCR_MAX_SIDE = 1200
@@ -48,24 +47,24 @@ def _analyze_page(page: str, do_ocr: bool = True) -> tuple[str, dict]:
 
 
 def analyze_file(path: str, mime: str) -> dict:
+    """Run the primary local screening path only.
+
+    External enrichment (Sightengine) is intentionally outside this function so
+    OCR/MRZ/local-forensics can be persisted and shown without waiting on a network call.
+    """
     with tempfile.TemporaryDirectory(prefix='sih26188-') as td:
         native_text = extract_pdf_text(path) if mime == 'application/pdf' else ''
         is_digital_pdf = len(native_text.strip()) >= 40
-
-        # Only the first PDF page is rendered for visual screening. Native PDF text
-        # extraction is used whenever possible, avoiding Tesseract entirely.
         pages = render_pdf(path, td, PDF_FORENSIC_PAGES) if mime == 'application/pdf' else [path]
         pages = pages[:MAX_PDF_PAGES]
         if not pages:
-            return {'document_type': 'unknown', 'extracted_data': {'document_type': 'unknown', 'ocr_text': '', 'mrz': {}}, 'forensics': [], 'forensic_assessment': {'status': 'not_evaluated'}, 'sightengine': {'available': False, 'status': 'not_evaluated'}, 'pages_processed': 0, 'processed_at': datetime.now(timezone.utc).isoformat()}
+            return {'document_type': 'unknown', 'extracted_data': {'document_type': 'unknown', 'ocr_text': '', 'mrz': {}}, 'forensics': [], 'forensic_assessment': {'status': 'not_evaluated'}, 'pages_processed': 0, 'processed_at': datetime.now(timezone.utc).isoformat()}
 
-        # For images/scanned PDFs, local OCR/forensics and Sightengine run together.
-        # Digital PDFs skip OCR and only perform the visual forensic pass.
+        # Digital PDFs use the native text layer and skip Tesseract.
+        # Scanned PDFs/images use OCR and local forensics in parallel.
         with ThreadPoolExecutor(max_workers=3) as pool:
             page_futures = [pool.submit(_analyze_page, page, do_ocr=not is_digital_pdf) for page in pages]
-            sight_future = pool.submit(analyze_with_sightengine, pages[0])
             results = [future.result() for future in page_futures]
-            sightengine = sight_future.result()
 
         ocr_text = '\n'.join(result[0] for result in results)
         text = native_text if is_digital_pdf else ocr_text
@@ -75,11 +74,5 @@ def analyze_file(path: str, mime: str) -> dict:
         extracted = {'document_type': doc_type, 'ocr_text': text[:12000], 'mrz': mrz}
         validation = validate_mrz(mrz)
         forensic_assessment = assess_forensics(forensic)
-        recapture = ((sightengine.get('response') or {}).get('recapture') or {}).get('score')
-        genai = ((sightengine.get('response') or {}).get('genai') or {}).get('score')
-        if isinstance(recapture, (int, float)) and recapture > 0.5:
-            forensic_assessment = {'status': 'suspicious', 'reason': 'Sightengine detected a likely recapture from a screen or printout.', 'sightengine_recapture_score': recapture, **forensic_assessment}
-        elif isinstance(genai, (int, float)) and genai > 0.8:
-            forensic_assessment = {'status': 'suspicious', 'reason': 'Sightengine detected a high likelihood of AI-generated image content.', 'sightengine_genai_score': genai, **forensic_assessment}
         extracted['validation'] = validation
-        return {'document_type': doc_type, 'extracted_data': extracted, 'forensics': forensic, 'forensic_assessment': forensic_assessment, 'sightengine': sightengine, 'pages_processed': len(pages), 'processed_at': datetime.now(timezone.utc).isoformat()}
+        return {'document_type': doc_type, 'extracted_data': extracted, 'forensics': forensic, 'forensic_assessment': forensic_assessment, 'pages_processed': len(pages), 'processed_at': datetime.now(timezone.utc).isoformat()}
