@@ -10,14 +10,24 @@ from .validation import validate_mrz, assess_forensics
 from .sightengine import analyze_image as analyze_with_sightengine
 
 MAX_PDF_PAGES = 3
+PDF_FORENSIC_PAGES = 2
 OCR_MAX_SIDE = 1400
 OCR_TIMEOUT = 8
+PDF_TEXT_TIMEOUT = 5
 
 
-def render_pdf(path: str, outdir: str) -> list[str]:
+def render_pdf(path: str, outdir: str, pages: int = PDF_FORENSIC_PAGES) -> list[str]:
     prefix = os.path.join(outdir, 'page')
-    subprocess.run(['pdftoppm', '-png', '-r', '120', '-f', '1', '-l', str(MAX_PDF_PAGES), path, prefix], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(['pdftoppm', '-png', '-r', '120', '-f', '1', '-l', str(pages), path, prefix], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return sorted(str(p) for p in Path(outdir).glob('page-*.png'))
+
+
+def extract_pdf_text(path: str) -> str:
+    try:
+        result = subprocess.run(['pdftotext', '-layout', '-f', '1', '-l', str(MAX_PDF_PAGES), path, '-'], check=True, capture_output=True, text=True, timeout=PDF_TEXT_TIMEOUT)
+        return result.stdout[:12000]
+    except Exception:
+        return ''
 
 
 def ocr_image(path: str) -> str:
@@ -27,7 +37,9 @@ def ocr_image(path: str) -> str:
         return pytesseract.image_to_string(img, config='--psm 6', timeout=OCR_TIMEOUT)
 
 
-def _analyze_page(page: str) -> tuple[str, dict]:
+def _analyze_page(page: str, do_ocr: bool = True) -> tuple[str, dict]:
+    if not do_ocr:
+        return '', analyze_image(page)
     with ThreadPoolExecutor(max_workers=2) as pool:
         ocr_future = pool.submit(ocr_image, page)
         forensic_future = pool.submit(analyze_image, page)
@@ -36,22 +48,23 @@ def _analyze_page(page: str) -> tuple[str, dict]:
 
 def analyze_file(path: str, mime: str) -> dict:
     with tempfile.TemporaryDirectory(prefix='sih26188-') as td:
-        pages = render_pdf(path, td) if mime == 'application/pdf' else [path]
+        native_text = extract_pdf_text(path) if mime == 'application/pdf' else ''
+        is_digital_pdf = bool(native_text.strip())
+
+        # Digital PDFs: native text avoids the expensive OCR pass. Render only the first
+        # two pages for visual forensics. Scanned PDFs fall back to OCR.
+        pages = render_pdf(path, td, PDF_FORENSIC_PAGES) if mime == 'application/pdf' else [path]
         pages = pages[:MAX_PDF_PAGES]
-        if not pages:
-            return {'document_type': 'unknown', 'extracted_data': {'document_type': 'unknown', 'ocr_text': '', 'mrz': {}}, 'forensics': [], 'forensic_assessment': {'status': 'not_evaluated'}, 'sightengine': {'available': False, 'status': 'not_evaluated'}, 'pages_processed': 0, 'processed_at': datetime.now(timezone.utc).isoformat()}
 
-        # OCR, local forensics, and the external Sightengine request are independent.
-        # Run them concurrently so network latency is overlapped with CPU work.
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            page_futures = [pool.submit(_analyze_page, page) for page in pages]
-            sight_future = pool.submit(analyze_with_sightengine, pages[0])
+        with ThreadPoolExecutor(max_workers=max(1, len(pages) + 1)) as pool:
+            page_futures = [pool.submit(_analyze_page, page, do_ocr=not is_digital_pdf) for page in pages]
+            sight_future = pool.submit(analyze_with_sightengine, pages[0]) if pages else None
             results = [future.result() for future in page_futures]
-            sightengine = sight_future.result()
+            sightengine = sight_future.result() if sight_future else {'available': False, 'status': 'not_evaluated'}
 
-        texts = [result[0] for result in results]
+        ocr_text = '\n'.join(result[0] for result in results)
+        text = native_text if is_digital_pdf else ocr_text
         forensic = [result[1] for result in results]
-        text = '\n'.join(texts)
         mrz = parse_mrz(text)
         doc_type = 'passport' if mrz.get('format') == 'TD3' or re.search(r'\bPASSPORT\b', text, re.I) else 'unknown'
         extracted = {'document_type': doc_type, 'ocr_text': text[:12000], 'mrz': mrz}
