@@ -9,16 +9,17 @@ from .forensics import analyze_image
 from .validation import validate_mrz, assess_forensics
 from .sightengine import analyze_image as analyze_with_sightengine
 
+# Fast-path limits: keep screening responsive while retaining the core signals.
 MAX_PDF_PAGES = 3
-PDF_FORENSIC_PAGES = 2
-OCR_MAX_SIDE = 1400
-OCR_TIMEOUT = 8
-PDF_TEXT_TIMEOUT = 5
+PDF_FORENSIC_PAGES = 1
+OCR_MAX_SIDE = 1200
+OCR_TIMEOUT = 5
+PDF_TEXT_TIMEOUT = 3
 
 
 def render_pdf(path: str, outdir: str, pages: int = PDF_FORENSIC_PAGES) -> list[str]:
     prefix = os.path.join(outdir, 'page')
-    subprocess.run(['pdftoppm', '-png', '-r', '120', '-f', '1', '-l', str(pages), path, prefix], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(['pdftoppm', '-png', '-r', '100', '-f', '1', '-l', str(pages), path, prefix], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
     return sorted(str(p) for p in Path(outdir).glob('page-*.png'))
 
 
@@ -49,18 +50,22 @@ def _analyze_page(page: str, do_ocr: bool = True) -> tuple[str, dict]:
 def analyze_file(path: str, mime: str) -> dict:
     with tempfile.TemporaryDirectory(prefix='sih26188-') as td:
         native_text = extract_pdf_text(path) if mime == 'application/pdf' else ''
-        is_digital_pdf = bool(native_text.strip())
+        is_digital_pdf = len(native_text.strip()) >= 40
 
-        # Digital PDFs: native text avoids the expensive OCR pass. Render only the first
-        # two pages for visual forensics. Scanned PDFs fall back to OCR.
+        # Only the first PDF page is rendered for visual screening. Native PDF text
+        # extraction is used whenever possible, avoiding Tesseract entirely.
         pages = render_pdf(path, td, PDF_FORENSIC_PAGES) if mime == 'application/pdf' else [path]
         pages = pages[:MAX_PDF_PAGES]
+        if not pages:
+            return {'document_type': 'unknown', 'extracted_data': {'document_type': 'unknown', 'ocr_text': '', 'mrz': {}}, 'forensics': [], 'forensic_assessment': {'status': 'not_evaluated'}, 'sightengine': {'available': False, 'status': 'not_evaluated'}, 'pages_processed': 0, 'processed_at': datetime.now(timezone.utc).isoformat()}
 
-        with ThreadPoolExecutor(max_workers=max(1, len(pages) + 1)) as pool:
+        # For images/scanned PDFs, local OCR/forensics and Sightengine run together.
+        # Digital PDFs skip OCR and only perform the visual forensic pass.
+        with ThreadPoolExecutor(max_workers=3) as pool:
             page_futures = [pool.submit(_analyze_page, page, do_ocr=not is_digital_pdf) for page in pages]
-            sight_future = pool.submit(analyze_with_sightengine, pages[0]) if pages else None
+            sight_future = pool.submit(analyze_with_sightengine, pages[0])
             results = [future.result() for future in page_futures]
-            sightengine = sight_future.result() if sight_future else {'available': False, 'status': 'not_evaluated'}
+            sightengine = sight_future.result()
 
         ocr_text = '\n'.join(result[0] for result in results)
         text = native_text if is_digital_pdf else ocr_text
