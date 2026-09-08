@@ -1,0 +1,10 @@
+import { redirect } from 'next/navigation'
+import Link from 'next/link'
+import { createClient } from '@/lib/supabase/server'
+import { ArrowLeft, ArrowUpRight, FileCheck2 } from 'lucide-react'
+
+export default async function ScreeningsPage(){
+ const supabase=await createClient(); const {data:{user}}=await supabase.auth.getUser(); if(!user) redirect('/auth/login')
+ const {data:screenings}=await supabase.from('screenings').select('id,status,document_type,overall_assessment,risk_score,created_at').order('created_at',{ascending:false})
+ return <main className="min-h-screen p-4 md:p-8"><div className="mx-auto max-w-5xl"><Link href="/dashboard" className="inline-flex items-center gap-2 text-sm text-white/50 hover:text-white"><ArrowLeft size={16}/>Dashboard</Link><section className="material mt-5 rounded-[30px] p-6 md:p-8"><div className="flex items-end justify-between gap-4"><div><p className="text-sm text-white/40">Screening workspace</p><h1 className="mt-1 text-3xl font-semibold tracking-[-.04em]">Screening history</h1></div><Link href="/screenings/new" className="pressable rounded-xl bg-white px-4 py-2.5 text-sm font-medium text-black">New screening</Link></div>{!screenings?.length?<div className="py-20 text-center"><FileCheck2 className="mx-auto text-white/35"/><p className="mt-4 font-medium">No screenings yet.</p></div>:<div className="mt-6 space-y-2">{screenings.map(s=><Link key={s.id} href={`/screenings/${s.id}`} className="pressable flex items-center justify-between gap-4 rounded-2xl bg-white/[.035] p-4 hover:bg-white/[.055]"><div><div className="font-medium">{s.document_type||'Document screening'}</div><div className="mt-1 text-xs text-white/35">{new Date(s.created_at).toLocaleString()}</div></div><div className="flex items-center gap-4 text-right"><div><div className="text-sm capitalize text-white/65">{s.overall_assessment?.replaceAll('_',' ')||s.status}</div><div className="text-xs text-white/35">Risk {s.risk_score ?? '—'}</div></div><ArrowUpRight size={16} className="text-white/30"/></div></Link>)}</div>}</section></div></main>
+}
